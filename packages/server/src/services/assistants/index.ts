@@ -7,7 +7,8 @@ import { Credential } from '../../database/entities/Credential'
 import { decryptCredentialData, getAppVersion } from '../../utils'
 import { InternalFlowiseError } from '../../errors/internalFlowiseError'
 import { getErrorMessage } from '../../errors/utils'
-import { DeleteResult } from 'typeorm'
+import { DeleteResult, QueryRunner } from 'typeorm'
+import { FLOWISE_METRIC_COUNTERS, FLOWISE_COUNTER_STATUS } from '../../Interface.Metrics'
 
 const createAssistant = async (requestBody: any): Promise<Assistant> => {
     try {
@@ -111,6 +112,7 @@ const createAssistant = async (requestBody: any): Promise<Assistant> => {
             version: await getAppVersion(),
             assistantId: dbResponse.id
         })
+        appServer.metricsProvider?.incrementCounter(FLOWISE_METRIC_COUNTERS.ASSISTANT_CREATED, { status: FLOWISE_COUNTER_STATUS.SUCCESS })
         return dbResponse
     } catch (error) {
         throw new InternalFlowiseError(
@@ -289,10 +291,61 @@ const updateAssistant = async (assistantId: string, requestBody: any): Promise<A
     }
 }
 
+const importAssistants = async (newAssistants: Partial<Assistant>[], queryRunner?: QueryRunner): Promise<any> => {
+    try {
+        const appServer = getRunningExpressApp()
+        const repository = queryRunner ? queryRunner.manager.getRepository(Assistant) : appServer.AppDataSource.getRepository(Assistant)
+
+        // step 1 - check whether array is zero
+        if (newAssistants.length == 0) return
+
+        // step 2 - check whether ids are duplicate in database
+        let ids = '('
+        let count: number = 0
+        const lastCount = newAssistants.length - 1
+        newAssistants.forEach((newAssistant) => {
+            ids += `'${newAssistant.id}'`
+            if (lastCount != count) ids += ','
+            if (lastCount == count) ids += ')'
+            count += 1
+        })
+
+        const selectResponse = await repository
+            .createQueryBuilder('assistant')
+            .select('assistant.id')
+            .where(`assistant.id IN ${ids}`)
+            .getMany()
+        const foundIds = selectResponse.map((response) => {
+            return response.id
+        })
+
+        // step 3 - remove ids that are only duplicate
+        const prepVariables: Partial<Assistant>[] = newAssistants.map((newAssistant) => {
+            let id: string = ''
+            if (newAssistant.id) id = newAssistant.id
+            if (foundIds.includes(id)) {
+                newAssistant.id = undefined
+            }
+            return newAssistant
+        })
+
+        // step 4 - transactional insert array of entities
+        const insertResponse = await repository.insert(prepVariables)
+
+        return insertResponse
+    } catch (error) {
+        throw new InternalFlowiseError(
+            StatusCodes.INTERNAL_SERVER_ERROR,
+            `Error: variableService.importVariables - ${getErrorMessage(error)}`
+        )
+    }
+}
+
 export default {
     createAssistant,
     deleteAssistant,
     getAllAssistants,
     getAssistantById,
-    updateAssistant
+    updateAssistant,
+    importAssistants
 }
